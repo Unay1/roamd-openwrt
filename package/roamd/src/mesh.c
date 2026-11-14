@@ -1,0 +1,964 @@
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <netinet/ether.h>
+#include <libubox/uloop.h>
+
+#include <dlfcn.h>
+#include <libubox/ustream-ssl.h>
+
+#include "roamd.h"
+#include "mesh.h"
+
+#define MESH_FT_WATCH_INTERVAL	60000
+#define MESH_WPAD_INIT		"/etc/init.d/wpad"
+#define MESH_RRB_PROTO		"88b7"
+
+#define MESH_UBUS_TIMEOUT	500
+#define MESH_DEPS_FIRST		5000
+#define MESH_DEPS_RETRY		300000
+
+static struct uloop_timeout deps_timer;
+static bool deps_ready;
+static void deps_done(struct mesh_task *task, int ret);
+static struct mesh_task deps_job = { .done = deps_done };
+
+void mesh_dir_ensure(const char *path)
+{
+	mkdir(MESH_RUN_DIR, 0755);
+
+	if (path && strcmp(path, MESH_RUN_DIR))
+		mkdir(path, 0755);
+}
+
+struct ustream_ssl_ctx *mesh_ssl_context(const struct ustream_ssl_ops **ops)
+{
+	static const struct ustream_ssl_ops *cached;
+
+	if (!cached) {
+		void *dl = dlopen("libustream-ssl.so", RTLD_LAZY | RTLD_LOCAL);
+
+		cached = dl ? dlsym(dl, "ustream_ssl_ops") : NULL;
+
+		if (!cached)
+			return NULL;
+	}
+
+	*ops = cached;
+
+	return cached->context_new(false);
+}
+
+pid_t mesh_spawn_argv(char *const argv[])
+{
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		int fd = open("/dev/null", O_WRONLY);
+
+		setpgid(0, 0);
+
+		if (fd >= 0) {
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			close(fd);
+		}
+
+		execv(argv[0], argv);
+		_exit(127);
+	}
+
+	return pid;
+}
+
+pid_t mesh_spawn(const char *script, const char *arg1, const char *arg2)
+{
+	char *argv[5] = { "/bin/sh", (char *)script, (char *)arg1, (char *)arg2, NULL };
+
+	return mesh_spawn_argv(argv);
+}
+
+static void mesh_task_done(struct uloop_process *p, int ret)
+{
+	struct mesh_task *task = container_of(p, struct mesh_task, proc);
+
+	task->busy = false;
+	task->proc.pid = 0;
+
+	if (task->done)
+		task->done(task, ret);
+}
+
+bool mesh_task_run(struct mesh_task *task, char *const argv[])
+{
+	pid_t pid;
+
+	if (task->busy)
+		return false;
+
+	pid = mesh_spawn_argv(argv);
+
+	if (pid <= 0)
+		return false;
+
+	task->proc.pid = pid;
+	task->proc.cb = mesh_task_done;
+	uloop_process_add(&task->proc);
+	task->busy = true;
+
+	return true;
+}
+
+bool mesh_task_start(struct mesh_task *task, const char *script,
+		     const char *arg1, const char *arg2)
+{
+	pid_t pid;
+
+	if (task->busy)
+		return false;
+
+	pid = mesh_spawn(script, arg1, arg2);
+	if (pid <= 0)
+		return false;
+
+	task->proc.pid = pid;
+	task->proc.cb = mesh_task_done;
+	uloop_process_add(&task->proc);
+	task->busy = true;
+
+	return true;
+}
+
+void mesh_task_stop(struct mesh_task *task)
+{
+	if (task->busy && task->proc.pid > 0)
+		kill(-task->proc.pid, SIGTERM);
+}
+
+static void deps_done(struct mesh_task *task, int ret)
+{
+	deps_ready = ret == 0;
+
+	if (!deps_ready)
+		uloop_timeout_set(&deps_timer, MESH_DEPS_RETRY);
+}
+
+static void deps_cb(struct uloop_timeout *t)
+{
+	char *argv[3] = { MESH_DEPS_SCRIPT, "deps-ensure", NULL };
+
+	if (deps_job.busy)
+		return;
+
+	if (!mesh_task_run(&deps_job, argv))
+		uloop_timeout_set(&deps_timer, MESH_DEPS_RETRY);
+}
+
+void mesh_deps_start(void)
+{
+	if (deps_timer.cb)
+		return;
+
+	deps_timer.cb = deps_cb;
+	uloop_timeout_set(&deps_timer, MESH_DEPS_FIRST);
+}
+
+void mesh_deps_blob(struct blob_buf *b)
+{
+	char *state = mesh_slurp(MESH_DEPS_STATE, 256);
+
+	blobmsg_add_u8(b, "deps_ready", deps_ready);
+
+	if (state) {
+		state[strcspn(state, "\r\n")] = '\0';
+		if (state[0])
+			blobmsg_add_string(b, "deps_state", state);
+		free(state);
+	}
+}
+
+char *mesh_slurp(const char *path, size_t max)
+{
+	struct stat st;
+	char *buf;
+	int fd, n;
+	size_t size = max;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	if (!fstat(fd, &st) && st.st_size >= 0 && (size_t)st.st_size < size)
+		size = st.st_size;
+
+	buf = malloc(size + 1);
+	if (!buf) {
+		close(fd);
+		return NULL;
+	}
+
+	n = read(fd, buf, size);
+	close(fd);
+	if (n < 0) {
+		free(buf);
+		return NULL;
+	}
+
+	buf[n] = '\0';
+	return buf;
+}
+
+struct mesh_config mesh;
+struct list_head mesh_members = LIST_HEAD_INIT(mesh_members);
+
+enum mesh_field_type {
+	MESH_BOOL,
+	MESH_ROLE,
+	MESH_U32,
+	MESH_INT,
+	MESH_STR
+};
+
+struct mesh_field {
+	const char *name;
+	enum mesh_field_type type;
+	size_t offset;
+	size_t size;
+};
+
+#define MFIELD(n, t, f) { n, t, offsetof(struct mesh_config, f), sizeof(((struct mesh_config *)0)->f) }
+
+static const struct mesh_field fields[] = {
+	MFIELD("enabled", MESH_BOOL, enabled),
+	MFIELD("role", MESH_ROLE, role),
+	MFIELD("backhaul_enabled", MESH_BOOL, backhaul_enabled),
+	MFIELD("backhaul_ssid", MESH_STR, backhaul_ssid),
+	MFIELD("backhaul_key", MESH_STR, backhaul_key),
+	MFIELD("backhaul_parents", MESH_STR, backhaul_parents),
+	MFIELD("bh_limits", MESH_STR, bh_limits),
+	MFIELD("ft_key", MESH_STR, ft_key),
+	MFIELD("ft_kh", MESH_STR, ft_kh),
+	MFIELD("ssh_pubkey", MESH_STR, ssh_pubkey[MESH_KEY_ED25519]),
+	MFIELD("ssh_pubkey_rsa", MESH_STR, ssh_pubkey[MESH_KEY_RSA]),
+	MFIELD("wifi_shutdown", MESH_BOOL, wifi_shutdown),
+	MFIELD("node_ui", MESH_BOOL, node_ui),
+	MFIELD("backhaul_delta", MESH_INT, backhaul_delta),
+	MFIELD("backhaul_min_signal", MESH_INT, backhaul_min_signal),
+	MFIELD("auto_update", MESH_BOOL, auto_update),
+	MFIELD("auto_update_every", MESH_U32, auto_update_every),
+	MFIELD("auto_update_unit", MESH_STR, auto_update_unit),
+	MFIELD("auto_update_last", MESH_U32, auto_update_last),
+	MFIELD("auto_update_result", MESH_STR, auto_update_result),
+	MFIELD("pkg_url", MESH_STR, pkg_url),
+	MFIELD("controller_id", MESH_STR, controller_id),
+	MFIELD("controller_name", MESH_STR, controller_name),
+	MFIELD("controller_addr", MESH_STR, controller_addr),
+	MFIELD("controller_mac", MESH_STR, controller_mac),
+	MFIELD("member_id", MESH_STR, member_id),
+	MFIELD("networks_sum", MESH_STR, networks_sum)
+};
+
+#undef MFIELD
+
+void mesh_unquote(char *s)
+{
+	size_t len = strlen(s);
+
+	if (len >= 2 && (s[0] == '"' || s[0] == '\'') && s[len - 1] == s[0]) {
+		memmove(s, s + 1, len - 2);
+		s[len - 2] = 0;
+	}
+}
+
+const char *mesh_role_name(enum mesh_role role)
+{
+	return role == MESH_NODE ? "node" : "controller";
+}
+
+const char *mesh_self_node_id(void)
+{
+	if (mesh.role == MESH_NODE && mesh.member_id[0])
+		return mesh.member_id;
+
+	return "controller";
+}
+
+void mesh_ft_nasid(const char *node, uint8_t band, char *out, size_t len)
+{
+	snprintf(out, len, "%s-%s", node, band == MESH_BAND_5 ? "5" : "2");
+}
+
+bool mesh_chain_has(const char *chain, const char *id)
+{
+	size_t len = strlen(id);
+	const char *p = chain;
+
+	while (len && (p = strstr(p, id))) {
+		if ((p == chain || p[-1] == '-') && (p[len] == '\0' || p[len] == '-'))
+			return true;
+
+		p += len;
+	}
+
+	return false;
+}
+
+uint8_t mesh_band_bit(const char *name)
+{
+	if (!name || !name[0])
+		return 0;
+
+	return name[0] == '2' ? MESH_BAND_24 : MESH_BAND_5;
+}
+
+enum roam_band mesh_band_from_bit(uint8_t bit)
+{
+	return bit == MESH_BAND_5 ? BAND_HIGH : BAND_LOW;
+}
+
+static uint8_t local_band_mask(void)
+{
+	struct roam_bss *bss;
+	uint8_t mask = 0;
+
+	list_for_each_entry(bss, &roam_bss_list, list)
+		if (roam_bss_matches(bss))
+			mask |= roam_band_bit(bss->band);
+
+	return mask;
+}
+
+bool mesh_band_usable(uint8_t bit)
+{
+	if (!bit || mesh.role == MESH_NODE)
+		return true;
+
+	return (mesh.band_mask | local_band_mask()) & bit;
+}
+
+static const char *bss_nr_hex(struct blob_attr *nr)
+{
+	struct blob_attr *cur;
+	const char *best = NULL;
+	size_t best_len = 0;
+	int rem;
+
+	if (!nr)
+		return NULL;
+
+	blobmsg_for_each_attr(cur, nr, rem) {
+		if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING) {
+			const char *s = blobmsg_get_string(cur);
+			size_t len = strlen(s);
+
+			if (len > best_len) {
+				best_len = len;
+				best = s;
+			}
+		}
+	}
+
+	return best;
+}
+
+void mesh_aps_dump(struct blob_buf *b, const char *name)
+{
+	struct roam_bss *bss;
+	void *arr = blobmsg_open_array(b, name);
+
+	list_for_each_entry(bss, &roam_bss_list, list) {
+		const char *nr;
+		char bssid[18];
+		void *e;
+
+		if (!bss->ssid[0])
+			continue;
+
+		nr = bss_nr_hex(bss->nr);
+		e = blobmsg_open_table(b, NULL);
+
+		roam_mac_str(bss->bssid, bssid, sizeof(bssid));
+
+		blobmsg_add_string(b, "ifname", bss->ifname);
+		blobmsg_add_string(b, "bssid", bssid);
+		blobmsg_add_string(b, "ssid", bss->ssid);
+		blobmsg_add_u32(b, "channel", bss->channel);
+		blobmsg_add_string(b, "band", roam_band_name(bss->band));
+		blobmsg_add_u8(b, "neighbor_report", !!bss->nr);
+		if (nr)
+			blobmsg_add_string(b, "nr", nr);
+		blobmsg_close_table(b, e);
+	}
+
+	blobmsg_close_array(b, arr);
+}
+
+void mesh_backhaul_bss_set(bool up)
+{
+	struct uci_session u;
+	struct uci_element *e;
+	bool changed;
+	uint32_t id;
+
+	if (!uci_session_open(&u, "wireless"))
+		return;
+
+	uci_foreach_element(&u.pkg->sections, e) {
+		struct uci_section *s = uci_to_section(e);
+		char name[MESH_NAME_MAX];
+
+		if (strcmp(s->type, "wifi-device"))
+			continue;
+
+		snprintf(name, sizeof(name), "%s%s", MESH_BH_PREFIX, s->e.name);
+
+		if (!uci_lookup_section(u.ctx, u.pkg, name) &&
+		    (!up || !uci_session_add(&u, "wifi-iface", name)))
+			continue;
+
+		if (!up) {
+			uci_session_set(&u, name, "disabled", "1");
+			continue;
+		}
+
+		uci_session_set(&u, name, "device", s->e.name);
+		uci_session_set(&u, name, "mode", "ap");
+		uci_session_set(&u, name, "network", "lan");
+		uci_session_set(&u, name, "hidden", "1");
+		uci_session_set(&u, name, "wds", "1");
+		uci_session_set(&u, name, "encryption", "psk2");
+		uci_session_set(&u, name, "ssid", mesh.backhaul_ssid);
+		uci_session_set(&u, name, "key", mesh.backhaul_key);
+		uci_session_set(&u, name, "disabled", "0");
+	}
+
+	changed = u.dirty;
+	uci_session_close(&u);
+
+	if (changed && !ubus_lookup_id(ubus_ctx, "network", &id))
+		ubus_invoke(ubus_ctx, id, "reload", NULL, NULL, NULL, 1000);
+}
+
+struct mesh_neighbor {
+	char bssid[18];
+	char ssid[MESH_SSID_MAX];
+	char nr[160];
+};
+
+static struct mesh_neighbor mesh_nbr[MESH_NBR_MAX];
+static unsigned int mesh_nbr_n;
+
+void mesh_neighbors_set(struct blob_attr *arr)
+{
+	enum { N_BSSID, N_SSID, N_NR, __N_MAX };
+	static const struct blobmsg_policy np[__N_MAX] = {
+		[N_BSSID] = { "bssid", BLOBMSG_TYPE_STRING },
+		[N_SSID] = { "ssid", BLOBMSG_TYPE_STRING },
+		[N_NR] = { "nr", BLOBMSG_TYPE_STRING },
+	};
+	struct blob_attr *cur;
+	int rem;
+
+	mesh_nbr_n = 0;
+	if (!arr)
+		return;
+
+	blobmsg_for_each_attr(cur, arr, rem) {
+		struct blob_attr *tb[__N_MAX];
+		struct mesh_neighbor *n;
+
+		if (blobmsg_type(cur) != BLOBMSG_TYPE_TABLE || mesh_nbr_n >= MESH_NBR_MAX)
+			continue;
+
+		blobmsg_parse(np, __N_MAX, tb, blobmsg_data(cur), blobmsg_data_len(cur));
+		if (!tb[N_BSSID] || !tb[N_NR])
+			continue;
+
+		n = &mesh_nbr[mesh_nbr_n++];
+		memset(n, 0, sizeof(*n));
+		strncpy(n->bssid, blobmsg_get_string(tb[N_BSSID]), sizeof(n->bssid) - 1);
+		if (tb[N_SSID])
+			strncpy(n->ssid, blobmsg_get_string(tb[N_SSID]), sizeof(n->ssid) - 1);
+		strncpy(n->nr, blobmsg_get_string(tb[N_NR]), sizeof(n->nr) - 1);
+	}
+}
+
+static bool nbr_is_local(const char *bssid)
+{
+	struct roam_bss *bss;
+
+	list_for_each_entry(bss, &roam_bss_list, list) {
+		char bs[18];
+
+		roam_mac_str(bss->bssid, bs, sizeof(bs));
+		if (!strcasecmp(bs, bssid))
+			return true;
+	}
+
+	return false;
+}
+
+void mesh_neighbors_append(struct blob_buf *b, const char *ssid, int *count, int max)
+{
+	unsigned int i;
+
+	for (i = 0; i < mesh_nbr_n && *count < max; i++) {
+		struct mesh_neighbor *n = &mesh_nbr[i];
+		void *e;
+
+		if (ssid && n->ssid[0] && strcmp(n->ssid, ssid))
+			continue;
+		if (nbr_is_local(n->bssid))
+			continue;
+
+		e = blobmsg_open_array(b, NULL);
+		blobmsg_add_string(b, NULL, n->bssid);
+		blobmsg_add_string(b, NULL, n->ssid);
+		blobmsg_add_string(b, NULL, n->nr);
+		blobmsg_close_array(b, e);
+		(*count)++;
+	}
+}
+
+struct assoc_ctx {
+	struct mesh_assoc_idx *idx;
+	uint8_t band;
+	const char *enc;
+};
+
+static void assoc_bytes(struct blob_attr *t, uint64_t *out)
+{
+	static const struct blobmsg_policy bp = { "bytes", BLOBMSG_TYPE_INT64 };
+	struct blob_attr *v = NULL;
+
+	if (!t)
+		return;
+
+	blobmsg_parse(&bp, 1, &v, blobmsg_data(t), blobmsg_data_len(t));
+	if (v)
+		*out = blobmsg_get_u64(v);
+}
+
+static void assoc_phy(struct blob_attr *rate, struct mesh_assoc *a)
+{
+	enum { R_RATE, R_MHZ, R_NSS, R_HT, R_VHT, R_HE, __R_MAX };
+	static const struct blobmsg_policy rp[__R_MAX] = {
+		[R_RATE] = { "rate", BLOBMSG_TYPE_INT32 },
+		[R_MHZ] = { "mhz", BLOBMSG_TYPE_INT32 },
+		[R_NSS] = { "nss", BLOBMSG_TYPE_INT32 },
+		[R_HT] = { "ht", BLOBMSG_TYPE_INT8 },
+		[R_VHT] = { "vht", BLOBMSG_TYPE_INT8 },
+		[R_HE] = { "he", BLOBMSG_TYPE_INT8 },
+	};
+	struct blob_attr *tb[__R_MAX];
+	const char *std;
+
+	blobmsg_parse(rp, __R_MAX, tb, blobmsg_data(rate), blobmsg_data_len(rate));
+
+	if (tb[R_RATE])
+		a->rate = blobmsg_get_u32(tb[R_RATE]);
+	if (tb[R_MHZ])
+		a->width = blobmsg_get_u32(tb[R_MHZ]);
+	if (tb[R_NSS])
+		a->nss = blobmsg_get_u32(tb[R_NSS]);
+
+	if (tb[R_HE] && blobmsg_get_u8(tb[R_HE]))
+		std = "11ax";
+	else if (tb[R_VHT] && blobmsg_get_u8(tb[R_VHT]))
+		std = "11ac";
+	else if (tb[R_HT] && blobmsg_get_u8(tb[R_HT]))
+		std = "11n";
+	else
+		std = a->band == BAND_LOW ? "11g" : "11a";
+
+	strncpy(a->std, std, sizeof(a->std) - 1);
+}
+
+static void assoc_cb(struct ubus_request *req, int type, struct blob_attr *msg)
+{
+	static const struct blobmsg_policy lp = { "results", BLOBMSG_TYPE_ARRAY };
+	enum { A_MAC, A_RX, A_TX, A_CONNECTED, __A_MAX };
+	static const struct blobmsg_policy ap[__A_MAX] = {
+		[A_MAC] = { "mac", BLOBMSG_TYPE_STRING },
+		[A_RX] = { "rx", BLOBMSG_TYPE_TABLE },
+		[A_TX] = { "tx", BLOBMSG_TYPE_TABLE },
+		[A_CONNECTED] = { "connected_time", BLOBMSG_TYPE_INT32 },
+	};
+	struct assoc_ctx *ctx = req->priv;
+	struct blob_attr *results = NULL, *cur;
+	int rem;
+
+	blobmsg_parse(&lp, 1, &results, blob_data(msg), blob_len(msg));
+	if (!results)
+		return;
+
+	blobmsg_for_each_attr(cur, results, rem) {
+		struct blob_attr *tb[__A_MAX];
+		struct ether_addr *ea;
+		struct mesh_assoc *a;
+
+		if (ctx->idx->n >= MESH_ASSOC_MAX)
+			break;
+
+		blobmsg_parse(ap, __A_MAX, tb, blobmsg_data(cur), blobmsg_data_len(cur));
+		if (!tb[A_MAC])
+			continue;
+
+		ea = ether_aton(blobmsg_get_string(tb[A_MAC]));
+		if (!ea)
+			continue;
+
+		a = &ctx->idx->e[ctx->idx->n++];
+		memset(a, 0, sizeof(*a));
+		memcpy(a->addr, ea->ether_addr_octet, 6);
+		a->band = ctx->band;
+		if (tb[A_CONNECTED])
+			a->connected = blobmsg_get_u32(tb[A_CONNECTED]);
+		if (ctx->enc)
+			strncpy(a->enc, ctx->enc, sizeof(a->enc) - 1);
+		if (tb[A_TX])
+			assoc_phy(tb[A_TX], a);
+		assoc_bytes(tb[A_RX], &a->rx_bytes);
+		assoc_bytes(tb[A_TX], &a->tx_bytes);
+	}
+}
+
+static void info_cb(struct ubus_request *req, int type, struct blob_attr *msg)
+{
+	static const struct blobmsg_policy ep = { "encryption", BLOBMSG_TYPE_TABLE };
+	static const struct blobmsg_policy wp[2] = {
+		{ "wpa", BLOBMSG_TYPE_ARRAY },
+		{ "enabled", BLOBMSG_TYPE_INT8 },
+	};
+	struct blob_attr *enc = NULL, *tb[2], *cur;
+	char *out = req->priv;
+	int rem, max = 0;
+
+	blobmsg_parse(&ep, 1, &enc, blob_data(msg), blob_len(msg));
+	if (!enc)
+		return;
+
+	blobmsg_parse(wp, 2, tb, blobmsg_data(enc), blobmsg_data_len(enc));
+	if (tb[1] && !blobmsg_get_u8(tb[1]))
+		return;
+
+	if (tb[0])
+		blobmsg_for_each_attr(cur, tb[0], rem) {
+			int v = 0;
+
+			switch (blobmsg_type(cur)) {
+			case BLOBMSG_TYPE_INT32: v = blobmsg_get_u32(cur); break;
+			case BLOBMSG_TYPE_INT16: v = blobmsg_get_u16(cur); break;
+			case BLOBMSG_TYPE_INT8: v = blobmsg_get_u8(cur); break;
+			}
+
+			if (v > max)
+				max = v;
+		}
+
+	strcpy(out, max >= 3 ? "WPA3" : max == 2 ? "WPA2" : max == 1 ? "WPA" : "");
+}
+
+bool mesh_parent_mac(uint8_t *out)
+{
+	char line[256];
+	FILE *f;
+	bool found = false;
+
+	if (mesh.role != MESH_NODE || !mesh.controller_addr[0])
+		return false;
+
+	f = fopen("/proc/net/arp", "r");
+	if (!f)
+		return false;
+
+	while (!found && fgets(line, sizeof(line), f)) {
+		char ip[64], type[16], flags[16], hw[32];
+		struct ether_addr ea;
+
+		if (sscanf(line, "%63s %15s %15s %31s", ip, type, flags, hw) != 4)
+			continue;
+
+		if (strcmp(ip, mesh.controller_addr) || !strcmp(flags, "0x0"))
+			continue;
+
+		if (!ether_aton_r(hw, &ea))
+			continue;
+
+		memcpy(out, ea.ether_addr_octet, 6);
+		found = true;
+	}
+
+	fclose(f);
+
+	return found;
+}
+
+void mesh_assoc_collect(struct mesh_assoc_idx *idx)
+{
+	static struct blob_buf ab;
+	struct roam_bss *bss;
+	uint32_t iwinfo_id;
+
+	idx->n = 0;
+	if (ubus_lookup_id(ubus_ctx, "iwinfo", &iwinfo_id))
+		return;
+
+	list_for_each_entry(bss, &roam_bss_list, list) {
+		struct assoc_ctx ctx = { .idx = idx, .band = bss->band, .enc = NULL };
+		char enc[16] = "";
+
+		if (!bss->active)
+			continue;
+
+		if (mesh.backhaul_ssid[0] && !strcmp(bss->ssid, mesh.backhaul_ssid))
+			continue;
+
+		blob_buf_init(&ab, 0);
+		blobmsg_add_string(&ab, "device", bss->ifname);
+
+		ubus_invoke(ubus_ctx, iwinfo_id, "info", ab.head, info_cb, enc, MESH_UBUS_TIMEOUT);
+		ctx.enc = enc[0] ? enc : NULL;
+		ubus_invoke(ubus_ctx, iwinfo_id, "assoclist", ab.head, assoc_cb, &ctx, MESH_UBUS_TIMEOUT);
+	}
+}
+
+void mesh_assoc_blob(struct blob_buf *b, const struct mesh_assoc *a)
+{
+	if (a->wired) {
+		blobmsg_add_u8(b, "wired", 1);
+		return;
+	}
+
+	if (a->rate)
+		blobmsg_add_u32(b, "rate", a->rate);
+	if (a->std[0])
+		blobmsg_add_string(b, "std", a->std);
+	if (a->width)
+		blobmsg_add_u32(b, "width", a->width);
+	if (a->nss)
+		blobmsg_add_u32(b, "nss", a->nss);
+	if (a->connected)
+		blobmsg_add_u32(b, "connected", a->connected);
+	if (a->enc[0])
+		blobmsg_add_string(b, "encryption", a->enc);
+	if (a->rx_bytes)
+		blobmsg_add_u64(b, "rx_bytes", a->rx_bytes);
+	if (a->tx_bytes)
+		blobmsg_add_u64(b, "tx_bytes", a->tx_bytes);
+}
+
+void mesh_members_clear(void)
+{
+	struct mesh_member *m, *tmp;
+
+	list_for_each_entry_safe(m, tmp, &mesh_members, list) {
+		list_del(&m->list);
+		free(m);
+	}
+}
+
+struct mesh_member *mesh_member_by_name(const char *name)
+{
+	struct mesh_member *m;
+
+	list_for_each_entry(m, &mesh_members, list)
+		if (!strcmp(m->name, name))
+			return m;
+
+	return NULL;
+}
+
+void mesh_config_init(void)
+{
+	memset(&mesh, 0, sizeof(mesh));
+
+	mesh.enabled = true;
+	mesh.role = MESH_CONTROLLER;
+	mesh.backhaul_enabled = true;
+	mesh.backhaul_delta = MESH_BH_DELTA_DEFAULT;
+	mesh.backhaul_min_signal = MESH_BH_MIN_SIGNAL_DEFAULT;
+	mesh.auto_update_every = 1;
+	strcpy(mesh.auto_update_unit, "day");
+	strcpy(mesh.pkg_url, MESH_PKG_URL_DEFAULT);
+
+	mesh_members_clear();
+}
+
+static void member_str(struct uci_context *ctx, struct uci_section *s,
+		       const char *name, char *dst, size_t size)
+{
+	const char *v = uci_lookup_option_string(ctx, s, name);
+
+	if (v) {
+		strncpy(dst, v, size - 1);
+		dst[size - 1] = '\0';
+	}
+}
+
+void mesh_member_load(struct uci_context *ctx, struct uci_section *s)
+{
+	const char *managed = uci_lookup_option_string(ctx, s, "managed");
+	struct mesh_member *m = calloc(1, sizeof(*m));
+
+	if (!m)
+		return;
+
+	member_str(ctx, s, "id", m->id, sizeof(m->id));
+	member_str(ctx, s, "name", m->name, sizeof(m->name));
+	member_str(ctx, s, "hostname", m->hostname, sizeof(m->hostname));
+	member_str(ctx, s, "mac", m->mac, sizeof(m->mac));
+	member_str(ctx, s, "addr", m->addr, sizeof(m->addr));
+	m->managed = managed ? roam_uci_bool(managed) : true;
+
+	{
+		struct uci_option *o = uci_lookup_option(ctx, s, "bh_node");
+		struct uci_element *e;
+		size_t used = 0;
+
+		if (o && o->type == UCI_TYPE_LIST)
+			uci_foreach_element(&o->v.list, e) {
+				int n = snprintf(m->bh_nodes + used, sizeof(m->bh_nodes) - used,
+						 "%s%s", used ? "-" : "", e->name);
+
+				if (n < 0 || (size_t)n >= sizeof(m->bh_nodes) - used)
+					break;
+
+				used += (size_t)n;
+			}
+	}
+
+	list_add_tail(&m->list, &mesh_members);
+}
+
+static void field_apply(const struct mesh_field *f, const char *value)
+{
+	void *p = (char *)&mesh + f->offset;
+
+	switch (f->type) {
+	case MESH_BOOL:
+		*(bool *)p = roam_uci_bool(value);
+		break;
+	case MESH_ROLE:
+		*(enum mesh_role *)p = strcmp(value, "node") ? MESH_CONTROLLER : MESH_NODE;
+		break;
+	case MESH_U32:
+		*(uint32_t *)p = strtoul(value, NULL, 10);
+		break;
+	case MESH_INT:
+		*(int *)p = strtol(value, NULL, 10);
+		break;
+	case MESH_STR:
+		strncpy(p, value, f->size - 1);
+		((char *)p)[f->size - 1] = '\0';
+		break;
+	}
+}
+
+void mesh_config_apply(struct uci_context *ctx, struct uci_section *s)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(fields); i++) {
+		const char *v = uci_lookup_option_string(ctx, s, fields[i].name);
+
+		if (v)
+			field_apply(&fields[i], v);
+	}
+
+	if (!mesh.pkg_url[0])
+		snprintf(mesh.pkg_url, sizeof(mesh.pkg_url), "%s", MESH_PKG_URL_DEFAULT);
+}
+
+static struct uloop_timeout ft_watch;
+static struct mesh_task wpad_job;
+static bool ft_restarted;
+
+static bool rrb_orphaned(void)
+{
+	char line[256];
+	FILE *f = fopen("/proc/net/packet", "r");
+	bool found = false, bound = false;
+
+	if (!f)
+		return false;
+
+	while (fgets(line, sizeof(line), f)) {
+		char sk[32], proto[16];
+		unsigned int refcnt, type;
+		int iface;
+
+		if (sscanf(line, "%31s %u %u %15s %d", sk, &refcnt, &type, proto, &iface) != 5)
+			continue;
+
+		if (strcmp(proto, MESH_RRB_PROTO))
+			continue;
+
+		found = true;
+		if (iface > 0)
+			bound = true;
+	}
+
+	fclose(f);
+
+	return found && !bound;
+}
+
+static void ft_watch_cb(struct uloop_timeout *t)
+{
+	mesh_node_key_ensure();
+
+	if (!config.fast_transition || !rrb_orphaned())
+		ft_restarted = false;
+	else if (!ft_restarted) {
+		ft_restarted = true;
+		roam_log(ROAM_L_INFO,
+			 "mesh: key exchange socket lost its bridge, restarting wpad");
+		mesh_task_start(&wpad_job, MESH_RC_COMMON, MESH_WPAD_INIT, "restart");
+	}
+
+	uloop_timeout_set(t, MESH_FT_WATCH_INTERVAL);
+}
+
+void mesh_start(void)
+{
+	static bool log_loaded;
+
+	if (!mesh.enabled) {
+		roam_log(ROAM_L_INFO, "mesh: disabled");
+		return;
+	}
+
+	if (!log_loaded) {
+		mesh_log_load();
+		mesh_clients_load();
+		log_loaded = true;
+	}
+
+	mesh_deps_start();
+
+	ft_watch.cb = ft_watch_cb;
+	uloop_timeout_set(&ft_watch, MESH_FT_WATCH_INTERVAL);
+
+	if (mesh.role == MESH_NODE) {
+		roam_log(ROAM_L_INFO, "mesh: node of controller %s (%s)",
+			 mesh.controller_id[0] ? mesh.controller_id : "?",
+			 mesh.controller_addr[0] ? mesh.controller_addr : "?");
+		mesh_node_watch_start();
+		mesh_node_dumbap();
+	} else {
+		mesh_ctrl_ensure_id();
+		mesh_ssh_key_ensure();
+		roam_log(ROAM_L_INFO, "mesh: controller %s", mesh.controller_id);
+		mesh_ctrl_backhaul_apply();
+		mesh_ctrl_bridge_stp();
+		mesh_ctrl_poll_start();
+		mesh_ctrl_autoupdate_arm();
+		mesh_ctrl_sync();
+	}
+}
