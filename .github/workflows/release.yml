@@ -17,6 +17,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Validate shell syntax
+        run: |
+          sh -n build.sh repo.sh install.sh scripts/generate-apk-key.sh
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
