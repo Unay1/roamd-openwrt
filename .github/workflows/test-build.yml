@@ -11,11 +11,18 @@ jobs:
     name: OpenWrt 25.12.6 / mediatek-filogic
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout workflow repository
         uses: actions/checkout@v7
+
+      - name: Checkout roamd source
+        uses: actions/checkout@v7
+        with:
+          ref: import/upstream-roamd
+          path: source
 
       - name: Validate shell syntax
         run: |
+          cd source
           for script in build.sh repo.sh install.sh scripts/generate-apk-key.sh; do
             sh -n "$script"
           done
@@ -33,6 +40,7 @@ jobs:
           RELEASE: 25.12.6
           JOBS: 2
         run: |
+          cd source
           sh ./build.sh aarch64_cortex-a53
 
       - name: Prepare APK signing key
@@ -44,19 +52,20 @@ jobs:
             exit 1
           }
           mkdir -p /tmp/roamd-keys
-          printf '%s\\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
+          printf '%s\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
           chmod 600 /tmp/roamd-keys/roamd.pem
 
       - name: Verify APK signing key matches the published public key
         run: |
           openssl pkey -in /tmp/roamd-keys/roamd.pem -pubout -out /tmp/roamd-keys/roamd.pub
-          cmp -s /tmp/roamd-keys/roamd.pub keys/roamd-apk.pem || {
+          cmp -s /tmp/roamd-keys/roamd.pub source/keys/roamd-apk.pem || {
             echo "::error::APK_SIGN_KEY does not match keys/roamd-apk.pem"
             exit 1
           }
 
       - name: Build signed APK repository index
         run: |
+          cd source
           sh ./repo.sh index-feed 25.12 aarch64_cortex-a53 /tmp/roamd-keys
           test -s dist/25.12/aarch64_cortex-a53/packages.adb
           file dist/25.12/aarch64_cortex-a53/packages.adb
@@ -65,6 +74,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: roamd-openwrt-25.12.6-aarch64_cortex-a53-test
-          path: dist/25.12/aarch64_cortex-a53/
+          path: source/dist/25.12/aarch64_cortex-a53/
           if-no-files-found: error
           retention-days: 7
