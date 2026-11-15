@@ -49,7 +49,7 @@ check_conflicts() {
 
 install_key() {
     mkdir -p /etc/apk/keys
-    tmp="/tmp/roamd-apk.pem.$"
+    tmp="$(mktemp /tmp/roamd-apk.pem.XXXXXX)"
 
     wget -q -O "$tmp" "$RAW/keys/roamd-apk.pem" ||
         fail "Не удалось получить публичный ключ подписи roamd-openwrt."
