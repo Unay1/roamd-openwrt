@@ -52,7 +52,7 @@ jobs:
             exit 1
           }
           mkdir -p /tmp/roamd-keys
-          printf '%s\\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
+          printf '%s\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
           chmod 600 /tmp/roamd-keys/roamd.pem
 
       - name: Verify APK signing key matches the published public key
