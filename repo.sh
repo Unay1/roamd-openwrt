@@ -102,9 +102,9 @@ index_feed() {
 		[ -x "$apk" ] || { echo "в SDK нет apk" >&2; return 1; }
 
 		set -- --allow-untrusted
-		[ -f "$keys/roamd.pem" ] && set -- "$@" --sign-key "$keys/roamd.pem"
+		[ -f "$keys/roamd.pem" ] && set -- "$@" --sign "$keys/roamd.pem"
 
-		( cd "$dir" && "$apk" mkndx "$@" -o packages.adb ./*.apk ) || return 1
+		( cd "$dir" && "$apk" mkndx "$@" --output packages.adb ./*.apk ) || return 1
 		echo "  $branch/$arch: packages.adb$([ -f "$keys/roamd.pem" ] && echo ' (подписан)')"
 		return 0
 	fi
