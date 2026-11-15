@@ -1,6 +1,9 @@
 name: Test roamd build and APK signing
 
 on:
+  push:
+    branches:
+      - feature/self-hosted-feed
   workflow_dispatch:
 
 permissions:
