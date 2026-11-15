@@ -1,0 +1,88 @@
+name: Build and publish roamd packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: OpenWrt 25.12.6 / mediatek-filogic
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate shell syntax
+        run: |
+          sh -n build.sh repo.sh install.sh scripts/generate-apk-key.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget zstd
+
+      - name: Read and validate package version
+        id: version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^PKG_VERSION:=//p' package/roamd/Makefile | head -n1)"
+          [ -n "$version" ] || { echo "::error::PKG_VERSION not found"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            [ "$tag_version" = "$version" ] || {
+              echo "::error::Tag $tag_version does not match roamd version $version"
+              exit 1
+            }
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build packages with the official SDK
+        env:
+          RELEASE: 25.12.6
+          JOBS: 2
+        run: |
+          sh ./build.sh aarch64_cortex-a53
+
+      - name: Prepare APK signing key
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          [ -n "$APK_SIGN_KEY" ] || {
+            echo "::error::Add the APK_SIGN_KEY repository secret before publishing."
+            exit 1
+          }
+          mkdir -p /tmp/roamd-keys
+          printf '%s\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
+          chmod 600 /tmp/roamd-keys/roamd.pem
+
+      - name: Verify APK signing key matches the published public key
+        run: |
+          openssl pkey -in /tmp/roamd-keys/roamd.pem -pubout -out /tmp/roamd-keys/roamd.pub
+          cmp -s /tmp/roamd-keys/roamd.pub keys/roamd-apk.pem || {
+            echo "::error::APK_SIGN_KEY does not match keys/roamd-apk.pem"
+            exit 1
+          }
+
+      - name: Build signed APK repository index
+        run: |
+          sh ./repo.sh index-feed 25.12 aarch64_cortex-a53 /tmp/roamd-keys
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p publish/feed-25.12-aarch64_cortex-a53
+          cp dist/25.12/aarch64_cortex-a53/* publish/feed-25.12-aarch64_cortex-a53/
+
+      - name: Publish feed and versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sh ./repo.sh publish publish "${{ steps.version.outputs.version }}"
