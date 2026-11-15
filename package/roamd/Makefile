@@ -20,7 +20,7 @@ define Package/roamd
   DEPENDS:=+libubox +libubus +libuci +libblobmsg-json +libuclient
   CONFLICTS:=usteer dawn
   EXTRA_DEPENDS:=$(if $(CONFIG_USE_APK),!usteer (>=0)$(comma) !dawn (>=0))
-  URL:=https://github.com/Ground-Zerro/roamd
+  URL:=https://github.com/Unay1/roamd-openwrt
 endef
 
 define Package/roamd/description
