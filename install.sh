@@ -49,13 +49,13 @@ check_conflicts() {
 
 install_key() {
     mkdir -p /etc/apk/keys
-    tmp="/tmp/roamd-apk.rsa.pub.$$"
+    tmp="/tmp/roamd-apk.pem.$"
 
-    wget -q -O "$tmp" "$RAW/keys/roamd-apk.rsa.pub" ||
+    wget -q -O "$tmp" "$RAW/keys/roamd-apk.pem" ||
         fail "Не удалось получить публичный ключ подписи roamd-openwrt."
 
     [ -s "$tmp" ] || fail "Скачанный публичный ключ пуст."
-    mv "$tmp" /etc/apk/keys/roamd-apk.rsa.pub
+    mv "$tmp" /etc/apk/keys/roamd-apk.pem
     msg "Ключ подписи установлен."
 }
 
