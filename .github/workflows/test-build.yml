@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test-build:
-    name: OpenWrt 25.12.6 / mediatek-filogic
+    name: OpenWrt 25.12.6 / filogic + x86-64
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -29,12 +29,13 @@ jobs:
             gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
             unzip zlib1g-dev file wget zstd
 
-      - name: Build packages with the official SDK
+      - name: Build packages with the official SDKs
         env:
           RELEASE: 25.12.6
           JOBS: 2
         run: |
           sh ./build.sh aarch64_cortex-a53
+          sh ./build.sh x86_64
 
       - name: Prepare APK signing key
         env:
@@ -45,7 +46,7 @@ jobs:
             exit 1
           }
           mkdir -p /tmp/roamd-keys
-          printf '%s\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
+          printf '%s\\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
           chmod 600 /tmp/roamd-keys/roamd.pem
 
       - name: Verify APK signing key matches the published public key
@@ -56,16 +57,20 @@ jobs:
             exit 1
           }
 
-      - name: Build signed APK repository index
+      - name: Build signed APK repository indexes
         run: |
           sh ./repo.sh index-feed 25.12 aarch64_cortex-a53 /tmp/roamd-keys
+          sh ./repo.sh index-feed 25.12 x86_64 /tmp/roamd-keys
           test -s dist/25.12/aarch64_cortex-a53/packages.adb
-          file dist/25.12/aarch64_cortex-a53/packages.adb
+          test -s dist/25.12/x86_64/packages.adb
+          file dist/25.12/aarch64_cortex-a53/packages.adb dist/25.12/x86_64/packages.adb
 
       - name: Upload test packages (no release publishing)
         uses: actions/upload-artifact@v4
         with:
-          name: roamd-openwrt-25.12.6-aarch64_cortex-a53-test
-          path: dist/25.12/aarch64_cortex-a53/
+          name: roamd-openwrt-25.12.6-multiarch-test
+          path: |
+            dist/25.12/aarch64_cortex-a53/
+            dist/25.12/x86_64/
           if-no-files-found: error
           retention-days: 7
