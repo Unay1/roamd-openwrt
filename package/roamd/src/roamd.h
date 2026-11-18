@@ -24,6 +24,7 @@
 #define ROAMD_MDID_LEN		4
 #define ROAMD_NO_SIGNAL		0
 #define ROAMD_MAX_NEIGHBORS	8
+#define ROAMD_MEAS_MAX		6
 
 #define PAIR_NOT_MANAGED	0x0001
 #define PAIR_NO_PEER		0x0002
@@ -133,6 +134,12 @@ struct roam_bss {
 	uint8_t query_pending;
 };
 
+struct roam_meas {
+	uint8_t bssid[6];
+	int signal;
+	uint64_t seen;
+};
+
 struct roam_sta_band {
 	int signal;
 	uint64_t seen;
@@ -151,9 +158,17 @@ struct roam_sta {
 	struct roam_bss *bss;
 
 	uint64_t connected_since;
+	uint64_t security_since;
+	const char *security;
+	uint64_t left_at;
+	uint8_t left_band;
 	uint64_t last_steer;
 	uint64_t last_beacon_req;
+	uint64_t last_mesh_req;
+	uint8_t mesh_req_idx;
+	struct roam_meas meas[ROAMD_MEAS_MAX];
 
+	uint32_t polled;
 	uint32_t steer_count;
 	uint32_t flap_count;
 	uint64_t give_up_until;
@@ -221,6 +236,7 @@ bool roam_bss_matches(const struct roam_bss *bss);
 void roam_bss_recheck(void);
 void roam_neighbors_resync(void);
 int roam_bss_invoke(struct roam_bss *bss, const char *method, struct blob_buf *buf);
+void roam_bss_sta_security_query(const struct roam_bss *bss, const uint8_t *addr, uint64_t since);
 
 void roam_sta_setup(void);
 struct roam_sta *roam_sta_get(const uint8_t *addr, bool create);
@@ -231,6 +247,7 @@ void roam_sta_set_connected(struct roam_sta *sta, struct roam_bss *bss, int sign
 void roam_sta_disconnected(struct roam_sta *sta);
 void roam_sta_reset(struct roam_sta *sta);
 int roam_sta_signal(const struct roam_sta *sta, enum roam_band band);
+void roam_sta_measured(struct roam_sta *sta, const uint8_t *bssid, int signal);
 int roam_sta_signal_seen(const struct roam_sta *sta, enum roam_band band, uint32_t *age);
 
 bool roam_policy_allow(struct roam_sta *sta, struct roam_bss *bss, enum roam_event ev);
