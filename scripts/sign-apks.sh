@@ -29,19 +29,28 @@ apk="${sdk_dir}/staging_dir/host/bin/apk"
   exit 1
 }
 
+# apk-tools resolves --keys-dir relative to its root (/) rather than the
+# current working directory. Convert relative paths to absolute paths first.
+case "${public_keys_dir}" in
+  /*) ;;
+  *)
+    public_keys_dir=$(CDPATH= cd -P "${public_keys_dir}" && pwd -P)
+    ;;
+esac
+
 packages=$(find "${package_dir}" -maxdepth 1 -type f -name '*.apk' | sort)
 [ -n "${packages}" ] || {
   echo "ERROR: no APK packages found in ${package_dir}" >&2
   exit 1
 }
 
-printf '%s\n' "${packages}" | while IFS= read -r package; do
+printf '%s\\n' "${packages}" | while IFS= read -r package; do
   echo "Signing: ${package}"
-  "${apk}" --allow-untrusted adbsign \
+  "${apk}" --allow-untrusted adbsign \\
     --sign-key "${private_key}" --reset-signatures "${package}"
 done
 
-printf '%s\n' "${packages}" | while IFS= read -r package; do
+printf '%s\\n' "${packages}" | while IFS= read -r package; do
   echo "Verifying: ${package}"
   "${apk}" --keys-dir "${public_keys_dir}" verify -v "${package}"
 done
