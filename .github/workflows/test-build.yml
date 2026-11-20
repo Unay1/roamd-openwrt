@@ -46,14 +46,14 @@ jobs:
             exit 1
           }
           mkdir -p /tmp/roamd-keys
-          printf '%s\\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
+          printf '%s\n' "$APK_SIGN_KEY" > /tmp/roamd-keys/roamd.pem
           chmod 600 /tmp/roamd-keys/roamd.pem
 
       - name: Verify APK signing key matches the published public key
         run: |
           openssl pkey -in /tmp/roamd-keys/roamd.pem -pubout -out /tmp/roamd-keys/roamd.pub
-          cmp -s /tmp/roamd-keys/roamd.pub keys/roamd.pem || {
-            echo "::error::APK_SIGN_KEY does not match keys/roamd.pem"
+          cmp -s /tmp/roamd-keys/roamd.pub keys/roamd-apk.rsa.pub || {
+            echo "::error::APK_SIGN_KEY does not match keys/roamd-apk.rsa.pub"
             exit 1
           }
 
