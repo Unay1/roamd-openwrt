@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=roamd
-PKG_VERSION:=1.2.0-r2
+PKG_VERSION:=1.3.0-r2
 PKG_RELEASE:=
 
 PKG_LICENSE:=Apache-2.0
@@ -20,7 +20,7 @@ define Package/roamd
   DEPENDS:=+libubox +libubus +libuci +libblobmsg-json +libuclient
   CONFLICTS:=usteer dawn
   EXTRA_DEPENDS:=$(if $(CONFIG_USE_APK),!usteer (>=0)$(comma) !dawn (>=0))
-  URL:=https://github.com/Unay1/roamd-openwrt
+  URL:=https://github.com/Ground-Zerro/roamd
 endef
 
 define Package/roamd/description
