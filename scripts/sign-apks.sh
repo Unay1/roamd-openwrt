@@ -44,13 +44,13 @@ packages=$(find "${package_dir}" -maxdepth 1 -type f -name '*.apk' | sort)
   exit 1
 }
 
-printf '%s\\n' "${packages}" | while IFS= read -r package; do
+printf '%s\n' "${packages}" | while IFS= read -r package; do
   echo "Signing: ${package}"
-  "${apk}" --allow-untrusted adbsign \\
+  "${apk}" --allow-untrusted adbsign \
     --sign-key "${private_key}" --reset-signatures "${package}"
 done
 
-printf '%s\\n' "${packages}" | while IFS= read -r package; do
+printf '%s\n' "${packages}" | while IFS= read -r package; do
   echo "Verifying: ${package}"
   "${apk}" --keys-dir "${public_keys_dir}" verify -v "${package}"
 done
