@@ -22,7 +22,7 @@ jobs:
 
       - name: Validate scripts
         run: |
-          sh -n build.sh repo.sh install.sh scripts/generate-apk-key.sh
+          sh -n build.sh repo.sh install.sh scripts/generate-apk-key.sh scripts/sign-apks.sh
 
       - name: Install build dependencies
         run: |
@@ -58,6 +58,18 @@ jobs:
             echo "::error::APK_SIGN_KEY does not match keys/roamd-apk.rsa.pub"
             exit 1
           }
+
+      - name: Sign and verify individual APK packages
+        env:
+          ARCH: ${{ inputs.architecture }}
+        run: |
+          target=$(awk -v arch="$ARCH" '$1 == arch { print $2 }' targets/25.12.txt)
+          [ -n "$target" ] || {
+            echo "::error::Unknown OpenWrt package architecture: $ARCH"
+            exit 1
+          }
+          sdk_dir="build/sdk-25.12.6-$(printf '%s' "$target" | tr / -)"
+          sh ./scripts/sign-apks.sh "$sdk_dir" "dist/25.12/$ARCH" /tmp/roamd-keys/roamd.pem keys
 
       - name: Build signed APK feed
         env:
